@@ -114,7 +114,7 @@ jobs:
   # ─────────────────────────────────────────────────────────────────────
   build-macos:
     name: 🍎 macOS Universal (VST3, AU, CLAP, Standalone)
-    runs-on: macos-14
+    runs-on: macos-15
 
     steps:
       - name: Checkout
