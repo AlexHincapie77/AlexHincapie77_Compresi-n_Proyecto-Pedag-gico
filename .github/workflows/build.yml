@@ -1,5 +1,17 @@
 name: Build Plugins (Linux + Windows + macOS)
 
+# Compila el Pedagogical Compressor para los 3 SO en cada push:
+#   • Linux   x86_64  → VST3, LV2, CLAP, Standalone
+#   • Windows x64     → VST3, CLAP, Standalone (.dll, .clap, .exe)
+#   • macOS   Universal → VST3, AU, CLAP, Standalone (.vst3, .component, .clap, .app)
+#
+# Uso:
+#   1. Sube este repositorio a GitHub (público o privado).
+#   2. GitHub Actions compilará en los 3 SO en paralelo.
+#   3. Pestaña "Actions" → última ejecución → descarga los artefactos
+#      que necesites (uno por SO).
+#   4. También puede lanzarse manualmente con "Run workflow".
+
 on:
   push:
     branches: [ main, master ]
@@ -8,91 +20,134 @@ on:
   workflow_dispatch:
 
 jobs:
+  # ─────────────────────────────────────────────────────────────────────
+  #  LINUX  x86_64
+  # ─────────────────────────────────────────────────────────────────────
   build-linux:
-    name: Linux x86_64 (VST3, LV2, CLAP)
+    name: 🐧 Linux x86_64 (VST3, LV2, CLAP, Standalone)
     runs-on: ubuntu-24.04
+
     steps:
-      - uses: actions/checkout@v4
-      - name: Install deps
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             cmake git build-essential pkg-config \
             libfreetype6-dev libx11-dev libxcomposite-dev libxcursor-dev \
             libxext-dev libxinerama-dev libxrandr-dev libxrender-dev \
-            libglu1-mesa-dev mesa-common-dev libasound2-dev \
+            libglu1-mesa-dev mesa-common-dev \
+            libasound2-dev \
             libwebkit2gtk-4.1-dev libcurl4-openssl-dev
-      - name: Configure
+
+      - name: Configure CMake
         run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+
       - name: Build
         run: cmake --build build -j$(nproc)
-      - name: Stage
+
+      - name: Stage artefacts
         run: |
           mkdir -p staging
-          cp -r build/PedagogicalCompressor_artefacts/Release/VST3/* staging/ 2>/dev/null || true
-          cp -r build/PedagogicalCompressor_artefacts/Release/LV2/* staging/ 2>/dev/null || true
-          cp -r build/PedagogicalCompressor_artefacts/Release/CLAP/* staging/ 2>/dev/null || true
-          cp -r build/PedagogicalCompressor_artefacts/Release/Standalone/* staging/ 2>/dev/null || true
-      - name: Zip
-        run: cd staging && zip -r -q ../PedagogicalCompressor-linux-x64.zip .
-      - uses: actions/upload-artifact@v4
+          ART="build/PedagogicalCompressor_artefacts/Release"
+          cp -r "$ART/VST3/"*       staging/  2>/dev/null || true
+          cp -r "$ART/LV2/"*        staging/  2>/dev/null || true
+          cp -r "$ART/CLAP/"*       staging/  2>/dev/null || true
+          cp -r "$ART/Standalone/"* staging/  2>/dev/null || true
+
+      - name: Zip artefacts
+        run: |
+          cd staging
+          zip -r -q ../PedagogicalCompressor-linux-x64.zip .
+
+      - name: Upload Linux artefact
+        uses: actions/upload-artifact@v4
         with:
           name: PedagogicalCompressor-linux-x64
           path: PedagogicalCompressor-linux-x64.zip
           retention-days: 90
 
+  # ─────────────────────────────────────────────────────────────────────
+  #  WINDOWS  x64
+  # ─────────────────────────────────────────────────────────────────────
   build-windows:
-    name: Windows x64 (VST3, CLAP, Standalone)
+    name: 🪟 Windows x64 (VST3, CLAP, Standalone)
     runs-on: windows-2022
+
     steps:
-      - uses: actions/checkout@v4
-      - name: Configure
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure CMake
         shell: cmd
         run: cmake -B build -DCMAKE_BUILD_TYPE=Release -G "Visual Studio 17 2022" -A x64
+
       - name: Build
         shell: cmd
         run: cmake --build build --config Release -j
-      - name: Stage
+
+      - name: Stage artefacts
         shell: pwsh
         run: |
           $art = "build/PedagogicalCompressor_artefacts/Release"
           New-Item -ItemType Directory -Force -Path staging | Out-Null
-          if (Test-Path "$art/VST3")       { Copy-Item "$art/VST3/*" -Destination staging -Recurse -Force }
-          if (Test-Path "$art/CLAP")       { Copy-Item "$art/CLAP/*" -Destination staging -Recurse -Force }
-          if (Test-Path "$art/Standalone") { Copy-Item "$art/Standalone/*" -Destination staging -Recurse -Force }
-      - name: Zip
+          if (Test-Path "$art/VST3")      { Copy-Item -Path "$art/VST3/*"      -Destination staging -Recurse -Force }
+          if (Test-Path "$art/CLAP")      { Copy-Item -Path "$art/CLAP/*"      -Destination staging -Recurse -Force }
+          if (Test-Path "$art/Standalone"){ Copy-Item -Path "$art/Standalone/*" -Destination staging -Recurse -Force }
+
+      - name: Zip artefacts
         shell: pwsh
-        run: Compress-Archive -Path staging/* -DestinationPath PedagogicalCompressor-windows-x64.zip -Force
-      - uses: actions/upload-artifact@v4
+        run: |
+          Compress-Archive -Path staging/* -DestinationPath PedagogicalCompressor-windows-x64.zip -Force
+
+      - name: Upload Windows artefact
+        uses: actions/upload-artifact@v4
         with:
           name: PedagogicalCompressor-windows-x64
           path: PedagogicalCompressor-windows-x64.zip
           retention-days: 90
 
+  # ─────────────────────────────────────────────────────────────────────
+  #  macOS  Universal Binary (Intel + Apple Silicon)
+  # ─────────────────────────────────────────────────────────────────────
   build-macos:
-    name: macOS Universal (VST3, AU, CLAP, Standalone)
+    name: 🍎 macOS Universal (VST3, AU, CLAP, Standalone)
     runs-on: macos-14
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Select Xcode
         run: sudo xcode-select -s /Applications/Xcode.app
-      - name: Configure
+
+      - name: Configure CMake (Universal Binary + AU)
         run: |
           cmake -B build -DCMAKE_BUILD_TYPE=Release \
                 -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
                 -DCMAKE_OSX_DEPLOYMENT_TARGET="11.0"
+
       - name: Build
         run: cmake --build build -j$(sysctl -n hw.ncpu) --config Release
-      - name: Stage
+
+      - name: Stage artefacts
         run: |
           mkdir -p staging
-          cp -R build/PedagogicalCompressor_artefacts/Release/VST3/* staging/ 2>/dev/null || true
-          cp -R build/PedagogicalCompressor_artefacts/Release/AU/* staging/ 2>/dev/null || true
-          cp -R build/PedagogicalCompressor_artefacts/Release/CLAP/* staging/ 2>/dev/null || true
-          cp -R build/PedagogicalCompressor_artefacts/Release/Standalone/* staging/ 2>/dev/null || true
-      - name: Zip
-        run: cd staging && zip -r -y -q ../PedagogicalCompressor-macos-universal.zip .
-      - uses: actions/upload-artifact@v4
+          ART="build/PedagogicalCompressor_artefacts/Release"
+          cp -R "$ART/VST3/"*       staging/ 2>/dev/null || true
+          cp -R "$ART/AU/"*         staging/ 2>/dev/null || true
+          cp -R "$ART/CLAP/"*       staging/ 2>/dev/null || true
+          cp -R "$ART/Standalone/"* staging/ 2>/dev/null || true
+
+      - name: Zip artefacts
+        run: |
+          cd staging
+          zip -r -y -q ../PedagogicalCompressor-macos-universal.zip .
+
+      - name: Upload macOS artefact
+        uses: actions/upload-artifact@v4
         with:
           name: PedagogicalCompressor-macos-universal
           path: PedagogicalCompressor-macos-universal.zip
