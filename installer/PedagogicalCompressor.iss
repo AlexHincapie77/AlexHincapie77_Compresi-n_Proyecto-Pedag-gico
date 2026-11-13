@@ -16,7 +16,7 @@
 ; ============================================================================
 
 #ifndef BuildDir
-#define BuildDir "build\PedagogicalCompressor_artefacts\Release"
+  #define BuildDir AddBackslash(ExtractFilePath(SourcePath)) + "..\build\PedagogicalCompressor_artefacts\Release"
 #endif
 
 [Setup]

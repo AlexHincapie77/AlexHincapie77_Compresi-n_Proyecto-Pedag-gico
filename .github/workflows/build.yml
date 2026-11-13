@@ -118,6 +118,8 @@ jobs:
         run: |
           set -e
           echo "── Mide peak/RMS/clipping con 1,2,3,4 bandas + presets + AutoMK/Sat/AutoGain ──"
+          CLAP_FILE="build/PedagogicalCompressor_artefacts/Release/CLAP/Pedagogical Compressor.clap"
+          test -f "$CLAP_FILE" || { echo "ERROR: $CLAP_FILE no existe"; exit 1; }
           CLAP_INC="build/_deps/clap_juce_extensions-src/clap-libs/clap/include"
           test -f "$CLAP_INC/clap/clap.h" || { echo "ERROR: no hay header CLAP"; exit 1; }
           gcc -O2 -o /tmp/satmeter extras/saturation_meter.c -I"$CLAP_INC" -ldl -lm
@@ -278,11 +280,19 @@ jobs:
       - name: Verify universal binary (arm64 + x86_64)
         run: |
           set -e
-          SO="build/PedagogicalCompressor_artefacts/Release/VST3/Pedagogical Compressor.vst3/Contents/MacOS/PedagogicalCompressor"
-          if [ ! -f "$SO" ]; then
-            echo "✗ No se encontró el binario del VST3"
+          VST3_BUNDLE="build/PedagogicalCompressor_artefacts/Release/VST3/Pedagogical Compressor.vst3"
+          if [ ! -d "$VST3_BUNDLE" ]; then
+            echo "✗ No se encontró el bundle VST3 en: $VST3_BUNDLE"
+            ls -la build/PedagogicalCompressor_artefacts/Release/VST3/ 2>/dev/null || true
             exit 1
           fi
+          SO=$(find "$VST3_BUNDLE/Contents/MacOS" -type f | head -1)
+          if [ -z "$SO" ]; then
+            echo "✗ No se encontró binario dentro del bundle VST3"
+            find "$VST3_BUNDLE" -type f
+            exit 1
+          fi
+          echo "  Binario VST3 encontrado: $SO"
           ARCHS=$(file "$SO" | grep -oE 'arm64|x86_64' | sort -u | tr '\n' ' ')
           echo "  Arquitecturas detectadas: $ARCHS"
           if echo "$ARCHS" | grep -q 'arm64' && echo "$ARCHS" | grep -q 'x86_64'; then
