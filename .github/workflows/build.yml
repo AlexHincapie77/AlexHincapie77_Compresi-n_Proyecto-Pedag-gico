@@ -1,0 +1,320 @@
+name: Build Plugins (Linux + Windows + macOS)
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+# Nota: los 3 jobs (build-linux, build-windows, build-macos) corren en paralelo
+# y son independientes — si uno falla, los otros dos siguen.
+# Así vemos si un problema es específico de un SO o general.
+jobs:
+  build-linux:
+    name: Linux x86_64 (VST3, LV2, CLAP, Standalone)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # Cache de las deps de JUCE y clap-juce-extensions entre builds
+      # Acelera los builds posteriores de 10+ min a ~3 min
+      - name: Cache JUCE build deps
+        uses: actions/cache@v4
+        with:
+          path: |
+            build/_deps
+            ~/.cache/ccache
+          key: linux-juce-${{ hashFiles('CMakeLists.txt') }}
+          restore-keys: linux-juce-
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake git build-essential pkg-config \
+            libfreetype6-dev libx11-dev libxcomposite-dev libxcursor-dev \
+            libxext-dev libxinerama-dev libxrandr-dev libxrender-dev \
+            libglu1-mesa-dev mesa-common-dev libasound2-dev \
+            libwebkit2gtk-4.1-dev libcurl4-openssl-dev
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build -j$(nproc)
+
+      - name: Verify all 4 formats exist
+        run: |
+          set -e
+          ART="build/PedagogicalCompressor_artefacts/Release"
+          echo "── Verificando artefactos ──"
+          for fmt in VST3 LV2 CLAP Standalone; do
+            if [ -d "${ART}/${fmt}" ]; then
+              echo "  ✔ ${fmt} generado"
+              ls -la "${ART}/${fmt}/" | head -5
+            else
+              echo "  ✗ ${fmt} NO generado"
+              exit 1
+            fi
+          done
+
+      - name: Verify CLAP loads (mini-host en C)
+        run: |
+          set -e
+          echo "── Verificando que el .clap se genera y carga correctamente ──"
+          CLAP_FILE="build/PedagogicalCompressor_artefacts/Release/CLAP/Pedagogical Compressor.clap"
+          test -f "$CLAP_FILE" || { echo "ERROR: $CLAP_FILE no existe"; exit 1; }
+
+          # Comprobar que exporta clap_entry
+          nm -D "$CLAP_FILE" | grep -q 'D clap_entry' || { echo "ERROR: clap_entry no exportado"; exit 1; }
+          echo "✔ clap_entry exportado"
+
+          # Mini-host en C que dlopen + init + get_factory + get_plugin_count
+          cat > /tmp/clap_load.c <<'EOF'
+          #define _GNU_SOURCE
+          #include <stdio.h>
+          #include <stdint.h>
+          #include <stdbool.h>
+          #include <dlfcn.h>
+          typedef struct { uint32_t major, minor, revision; } clap_version_t;
+          typedef struct {
+            clap_version_t clap_version;
+            bool  (*init)(const char*);
+            void  (*deinit)(void);
+            const void *(*get_factory)(const char*);
+          } clap_plugin_entry_t;
+          typedef struct {
+            uint32_t (*get_plugin_count)(const void*);
+            const void *(*get_plugin_descriptor)(const void*, uint32_t);
+            const void *(*create_plugin)(const void*, const void*, const char*);
+          } clap_plugin_factory_t;
+          int main(int argc, char** argv) {
+            if (argc < 2) return 2;
+            void *h = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
+            if (!h) { fprintf(stderr, "FAIL dlopen: %s\n", dlerror()); return 1; }
+            void *sym = dlsym(h, "clap_entry");
+            if (!sym) { fprintf(stderr, "FAIL: no clap_entry\n"); dlclose(h); return 1; }
+            clap_plugin_entry_t *e = (clap_plugin_entry_t*)sym;
+            fprintf(stderr, "  clap_version = %u.%u.%u\n",
+                    e->clap_version.major, e->clap_version.minor, e->clap_version.revision);
+            if (!e->init(argv[1])) { fprintf(stderr, "FAIL: init() returned false\n"); return 1; }
+            const void *f = e->get_factory("clap.plugin-factory");
+            if (!f) { fprintf(stderr, "FAIL: get_factory() returned NULL\n"); return 1; }
+            clap_plugin_factory_t *pf = (clap_plugin_factory_t*)f;
+            uint32_t n = pf->get_plugin_count(pf);
+            if (n == 0) { fprintf(stderr, "FAIL: plugin_count = 0\n"); return 1; }
+            fprintf(stderr, "  plugin_count = %u\n", n);
+            e->deinit();
+            dlclose(h);
+            fprintf(stderr, ">>> CLAP OK\n");
+            return 0;
+          }
+          EOF
+          gcc -o /tmp/clap_load /tmp/clap_load.c -ldl
+          /tmp/clap_load "$CLAP_FILE"
+
+      - name: Regression test — saturación multibanda (1→4 bandas)
+        run: |
+          set -e
+          echo "── Mide peak/RMS/clipping con 1,2,3,4 bandas + presets + AutoMK/Sat/AutoGain ──"
+          CLAP_INC="build/_deps/clap_juce_extensions-src/clap-libs/clap/include"
+          test -f "$CLAP_INC/clap/clap.h" || { echo "ERROR: no hay header CLAP"; exit 1; }
+          gcc -O2 -o /tmp/satmeter extras/saturation_meter.c -I"$CLAP_INC" -ldl -lm
+          /tmp/satmeter "$CLAP_FILE" > /tmp/sat_out.txt 2>&1 || { cat /tmp/sat_out.txt; echo "ERROR: el test crasheó"; exit 1; }
+          cat /tmp/sat_out.txt | grep -E "banda|preset|todo|AutoMK|Sat"
+          # Comprobación automática: con defaults, el RMS de 1 banda vs 4 bandas
+          # no debe diferir más de 1.5 dB (reconstrucción LR plana).
+          python3 - <<'PYEOF'
+          import re, sys
+          txt = open('/tmp/sat_out.txt').read()
+          def rms(label):
+              m = re.search(re.escape(label) + r'.*?rms\s+(-?\d+\.\d+)', txt)
+              return float(m.group(1)) if m else None
+          r1, r4 = rms('1 banda (medido)'), rms('4 bandas (medido)')
+          if r1 is None or r4 is None:
+              print('ERROR: no pude leer los RMS'); sys.exit(1)
+          diff = abs(r1 - r4)
+          print(f'RMS 1 banda: {r1} dB | 4 bandas: {r4} dB | diferencia: {diff:.2f} dB')
+          if diff > 1.5:
+              print('FALLO: la reconstrucción multibanda NO es plana (>1.5 dB)'); sys.exit(1)
+          if 'NaN [1-9]' in txt or re.search(r'NaN [1-9]', txt):
+              print('FALLO: hay muestras NaN/Inf'); sys.exit(1)
+          print('✔ Reconstrucción plana verificada, sin NaN')
+          PYEOF
+
+      - name: Stage
+        run: |
+          mkdir -p staging
+          cp -r build/PedagogicalCompressor_artefacts/Release/VST3/* staging/ 2>/dev/null || true
+          cp -r build/PedagogicalCompressor_artefacts/Release/LV2/* staging/ 2>/dev/null || true
+          cp -r build/PedagogicalCompressor_artefacts/Release/CLAP/* staging/ 2>/dev/null || true
+          cp -r build/PedagogicalCompressor_artefacts/Release/Standalone/* staging/ 2>/dev/null || true
+
+      - name: Zip
+        run: cd staging && zip -r -q ../PedagogicalCompressor-linux-x64.zip .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PedagogicalCompressor-linux-x64
+          path: PedagogicalCompressor-linux-x64.zip
+          retention-days: 90
+
+  build-windows:
+    name: Windows x64 (VST3, CLAP, Standalone + Setup.exe)
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache JUCE build deps
+        uses: actions/cache@v4
+        with:
+          path: |
+            build/_deps
+          key: windows-juce-${{ hashFiles('CMakeLists.txt') }}
+          restore-keys: windows-juce-
+
+      - name: Configure
+        shell: cmd
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -G "Visual Studio 17 2022" -A x64
+
+      - name: Build
+        shell: cmd
+        run: cmake --build build --config Release -j
+
+      - name: Verify all 3 formats exist
+        shell: pwsh
+        run: |
+          $art = "build/PedagogicalCompressor_artefacts/Release"
+          Write-Host "── Verificando artefactos ──"
+          foreach ($fmt in @("VST3", "CLAP", "Standalone")) {
+            if (Test-Path "$art/$fmt") {
+              Write-Host "  ✔ $fmt generado"
+              Get-ChildItem "$art/$fmt" | Select-Object -First 5 | ForEach-Object { Write-Host "    $($_.Name)" }
+            } else {
+              Write-Host "  ✗ $fmt NO generado"
+              exit 1
+            }
+          }
+
+      - name: Build installer .exe (InnoSetup)
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { $iscc = "${env:ProgramFiles}\Inno Setup 6\ISCC.exe" }
+          & $iscc "installer/PedagogicalCompressor.iss"
+          if (-not (Test-Path "installer/Output/PedagogicalCompressor-Setup.exe")) {
+            Write-Error "El instalador no se generó"; exit 1
+          }
+
+      - name: Stage binaries
+        shell: pwsh
+        run: |
+          $art = "build/PedagogicalCompressor_artefacts/Release"
+          New-Item -ItemType Directory -Force -Path staging | Out-Null
+          if (Test-Path "$art/VST3")       { Copy-Item "$art/VST3/*" -Destination staging -Recurse -Force }
+          if (Test-Path "$art/CLAP")       { Copy-Item "$art/CLAP/*" -Destination staging -Recurse -Force }
+          if (Test-Path "$art/Standalone") { Copy-Item "$art/Standalone/*" -Destination staging -Recurse -Force }
+
+      - name: Zip binaries
+        shell: pwsh
+        run: Compress-Archive -Path staging/* -DestinationPath PedagogicalCompressor-windows-x64.zip -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PedagogicalCompressor-windows-x64
+          path: PedagogicalCompressor-windows-x64.zip
+          retention-days: 90
+
+      - name: Upload Setup.exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: PedagogicalCompressor-windows-Setup
+          path: installer/Output/PedagogicalCompressor-Setup.exe
+          retention-days: 90
+
+  build-macos:
+    name: macOS Universal (VST3, AU, CLAP, Standalone)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache JUCE build deps
+        uses: actions/cache@v4
+        with:
+          path: |
+            build/_deps
+          key: macos-juce-${{ hashFiles('CMakeLists.txt') }}
+          restore-keys: macos-juce-
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app
+
+      - name: Configure
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
+                -DCMAKE_OSX_DEPLOYMENT_TARGET="11.0"
+
+      - name: Build
+        run: cmake --build build -j$(sysctl -n hw.ncpu) --config Release
+
+      - name: Verify all 4 formats exist
+        run: |
+          set -e
+          ART="build/PedagogicalCompressor_artefacts/Release"
+          echo "── Verificando artefactos ──"
+          for fmt in VST3 AU CLAP Standalone; do
+            if [ -d "${ART}/${fmt}" ]; then
+              echo "  ✔ ${fmt} generado"
+              ls -la "${ART}/${fmt}/" | head -5
+            else
+              echo "  ✗ ${fmt} NO generado"
+              exit 1
+            fi
+          done
+
+      - name: Verify universal binary (arm64 + x86_64)
+        run: |
+          set -e
+          SO="build/PedagogicalCompressor_artefacts/Release/VST3/Pedagogical Compressor.vst3/Contents/MacOS/PedagogicalCompressor"
+          if [ ! -f "$SO" ]; then
+            echo "✗ No se encontró el binario del VST3"
+            exit 1
+          fi
+          ARCHS=$(file "$SO" | grep -oE 'arm64|x86_64' | sort -u | tr '\n' ' ')
+          echo "  Arquitecturas detectadas: $ARCHS"
+          if echo "$ARCHS" | grep -q 'arm64' && echo "$ARCHS" | grep -q 'x86_64'; then
+            echo "  ✔ Binario universal verificado"
+          else
+            echo "  ✗ El binario NO es universal"
+            exit 1
+          fi
+
+      - name: Validate AU component with auval
+        run: |
+          # auval -vt: valida el componente AU contra el suite de Apple
+          # aumf = tipo (effect), Pdcm = sub-type (PLUGIN_CODE), Peda = manufacturer (PLUGIN_MANUFACTURER_CODE)
+          # Si pasa, Logic Pro lo listará automáticamente
+          auval -vt aumf Pdcm Peda || {
+            echo "⚠ auval falló — el AU puede no cargarse en Logic Pro"
+            echo "  (continuamos igualmente para generar el artefacto)"
+          }
+
+      - name: Stage
+        run: |
+          mkdir -p staging
+          cp -R build/PedagogicalCompressor_artefacts/Release/VST3/* staging/ 2>/dev/null || true
+          cp -R build/PedagogicalCompressor_artefacts/Release/AU/* staging/ 2>/dev/null || true
+          cp -R build/PedagogicalCompressor_artefacts/Release/CLAP/* staging/ 2>/dev/null || true
+          cp -R build/PedagogicalCompressor_artefacts/Release/Standalone/* staging/ 2>/dev/null || true
+
+      - name: Zip
+        run: cd staging && zip -r -y -q ../PedagogicalCompressor-macos-universal.zip .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PedagogicalCompressor-macos-universal
+          path: PedagogicalCompressor-macos-universal.zip
+          retention-days: 90
