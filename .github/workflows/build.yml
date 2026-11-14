@@ -205,10 +205,17 @@ jobs:
           choco install innosetup -y --no-progress
           $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
           if (-not (Test-Path $iscc)) { $iscc = "${env:ProgramFiles}\Inno Setup 6\ISCC.exe" }
-          & $iscc "installer/PedagogicalCompressor.iss"
-          if (-not (Test-Path "installer/Output/PedagogicalCompressor-Setup.exe")) {
-            Write-Error "El instalador no se generó"; exit 1
+          # ISCC cambia al directorio del .iss al procesarlo.  Pasamos /O con
+          # ruta absoluta para forzar el directorio de salida al raíz del repo.
+          $outputDir = "$(Get-Location)\installer\Output"
+          New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
+          & $iscc /O"$outputDir" "installer/PedagogicalCompressor.iss"
+          if (-not (Test-Path "$outputDir/PedagogicalCompressor-Setup.exe")) {
+            Write-Error "El instalador no se generó en $outputDir"
+            Get-ChildItem -Recurse installer\Output 2>$null
+            exit 1
           }
+          Write-Host "Instalador generado: $outputDir\PedagogicalCompressor-Setup.exe"
 
       - name: Stage binaries
         shell: pwsh
